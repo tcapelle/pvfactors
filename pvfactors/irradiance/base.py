@@ -8,15 +8,48 @@ class BaseModel(object):
     cats = None
     irradiance_comp = None
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         """Not implemented"""
         raise NotImplementedError
 
-    def fit(self):
+    def fit(self, *args, **kwargs):
         """Not implemented"""
         raise NotImplementedError
 
-    def transform(self):
+    def transform(self, *args, **kwargs):
+        """Not implemented"""
+        raise NotImplementedError
+
+    def transform_ts(self, *args, **kwargs):
+        """Not implemented"""
+        raise NotImplementedError
+
+    def get_full_modeling_vectors(self, *args, **kwargs):
+        """Not implemented"""
+        raise NotImplementedError
+
+    @property
+    def gnd_shaded(self):
+        """Not implemented"""
+        raise NotImplementedError
+
+    @property
+    def gnd_illum(self):
+        """Not implemented"""
+        raise NotImplementedError
+
+    @property
+    def pvrow_shaded(self):
+        """Not implemented"""
+        raise NotImplementedError
+
+    @property
+    def pvrow_illum(self):
+        """Not implemented"""
+        raise NotImplementedError
+
+    @property
+    def sky(self):
         """Not implemented"""
         raise NotImplementedError
 
@@ -59,3 +92,19 @@ class BaseModel(object):
             total_perez_vec.append(surface.get_param('total_perez'))
 
         return irradiance_vec, rho_vec, invrho_vec, total_perez_vec
+
+    def update_ts_surface_sky_term(self, ts_surface, name_sky_term='sky_term'):
+        """Update the 'sky_term' parameter of a timeseries surface.
+
+        Parameters
+        ----------
+        ts_surface :  :py:class:`~pvfactors.geometry.timeseries.TsSurface`
+            Timeseries surface whose 'sky_term' parameter value we want to
+            update
+        name_sky_term : str, optional
+            Name of the sky term parameter (Default = 'sky_term')
+        """
+        value = 0.
+        for component in self.irradiance_comp:
+            value += ts_surface.get_param(component)
+        ts_surface.update_params({name_sky_term: value})

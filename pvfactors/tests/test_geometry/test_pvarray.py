@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import pandas as pd
 from pvfactors.geometry import OrderedPVArray, PVGround, PVSurface
 from pvfactors.geometry.utils import contains
 from pvfactors.config import MAX_X_GROUND, MIN_X_GROUND
@@ -26,7 +27,7 @@ def test_ordered_pvarray_from_dict(params):
         pvarray.pvrows[0].front.n_vector, -pvarray.pvrows[0].back.n_vector)
     assert pvarray.pvrows[0].front.shaded_length == 0
     assert pvarray.gcr == params['gcr']
-    assert pvarray.surface_tilt == params['surface_tilt']
+    assert np.abs(pvarray.rotation_vec) == params['surface_tilt']
     assert pvarray.pvrows[0].front.n_vector[0] > 0
     distance_between_pvrows = \
         pvarray.pvrows[1].centroid.x - pvarray.pvrows[0].centroid.x
@@ -360,11 +361,11 @@ def test_view_matrix(params):
     # TODO: test values against saved array
 
 
-def test_surface_params(params):
+def test_param_names(params):
 
-    surface_params = ['qinc']
+    param_names = ['qinc']
     pvarray = OrderedPVArray.transform_from_dict_of_scalars(
-        params, surface_params=surface_params)
+        params, param_names=param_names)
 
     # Set all surfaces parameters to 1
     pvarray.update_params({'qinc': 1})
@@ -372,7 +373,7 @@ def test_surface_params(params):
     # Check that all surfaces of the correct surface params
     all_surfaces = pvarray.all_surfaces
     for surf in all_surfaces:
-        assert surf.surface_params == surface_params
+        assert surf.param_names == param_names
         assert surf.get_param('qinc') == 1
 
     # Check weighted values
@@ -454,7 +455,6 @@ def test_orderedpvarray_almost_flat():
 
 def test_time_ordered_pvarray(params):
 
-    # params.update({'surface_tilt': 0})
     from pvfactors.viewfactors import VFCalculator
 
     import time
@@ -533,9 +533,11 @@ def test_coords_ground_shadows():
         [([3.10075071, 5.19163641], [0., 0.]),
          ([5.18914857, 6.51846431], [0., 0.])]
     ]
+    gnd_shadow_coords = [shadow.coords.as_array
+                         for shadow in ordered_pvarray.ts_ground.shadows]
 
     np.testing.assert_almost_equal(
-        expected_gnd_shadow_coords, ordered_pvarray.ground_shadow_coords)
+        expected_gnd_shadow_coords, gnd_shadow_coords)
 
 
 def test_coords_cut_points():
@@ -565,8 +567,11 @@ def test_coords_cut_points():
         [[14.17820455, -0.90992559], [0., 0.]],
         [[19.17820455, 4.09007441], [0., 0.]]]
 
+    cut_pt_coords = [cut_point.as_array
+                     for cut_point in
+                     ordered_pvarray.ts_ground.cut_point_coords]
     np.testing.assert_almost_equal(
-        expected_cut_point_coords, ordered_pvarray.cut_point_coords)
+        expected_cut_point_coords, cut_pt_coords)
 
 
 def test_ordered_pvarray_from_dict_w_direct_shading():
@@ -606,8 +611,48 @@ def test_ordered_pvarray_from_dict_w_direct_shading():
     np.testing.assert_allclose(pvarray.pvrows[1].front.shaded_length,
                                0.05979874)
     assert pvarray.gcr == params['gcr']
-    assert pvarray.surface_tilt == params['surface_tilt']
+    assert np.abs(pvarray.rotation_vec) == params['surface_tilt']
     assert pvarray.pvrows[0].front.n_vector[0] < 0
     distance_between_pvrows = \
         pvarray.pvrows[1].centroid.x - pvarray.pvrows[0].centroid.x
     assert distance_between_pvrows == 2.5
+
+
+def test_ordered_pvarray_direct_shading():
+    """Test that direct shading is calculated correctly in the following
+    5 situations:
+    - PV rows tilted to the left and front side shading
+    - PV rows tilted to the right and front side shading
+    - PV rows tilted to the left and back side shading
+    - PV rows tilted to the right and back side shading
+    - no shading
+    """
+    # Base params
+    params = {
+        'n_pvrows': 3,
+        'pvrow_height': 1,
+        'pvrow_width': 1,
+        'axis_azimuth': 0.,
+        'gcr': 0.5
+    }
+    # Timeseries inputs
+    df_inputs = pd.DataFrame({
+        'solar_zenith': [70., 80., 80., 70., 10.],
+        'solar_azimuth': [270., 90., 270., 90., 90.],
+        'surface_tilt': [45., 45., 45., 45., 45.],
+        'surface_azimuth': [270., 270., 90., 90., 90.]})
+
+    # Initialize and fit pv array
+    pvarray = OrderedPVArray.init_from_dict(params)
+    # Fit pv array to timeseries data
+    pvarray.fit(df_inputs.solar_zenith, df_inputs.solar_azimuth,
+                df_inputs.surface_tilt, df_inputs.surface_azimuth)
+
+    expected_ts_front_shading = [0.24524505, 0., 0., 0.24524505, 0.]
+    expected_ts_back_shading = [0., 0.39450728, 0.39450728, 0., 0.]
+
+    # Test that timeseries shading calculated correctly
+    np.testing.assert_allclose(expected_ts_front_shading,
+                               pvarray.shaded_length_front)
+    np.testing.assert_allclose(expected_ts_back_shading,
+                               pvarray.shaded_length_back)
