@@ -20,10 +20,12 @@ class IsotropicOrdered(BaseModel):
     it to the PV array."""
 
     params = ['rho', 'inv_rho', 'direct', 'isotropic', 'reflection']
-    cats = ['ground', 'front_pvrow', 'back_pvrow']
+    cats = ['ground_illum', 'ground_shaded', 'front_illum_pvrow',
+            'back_illum_pvrow', 'front_shaded_pvrow', 'back_shaded_pvrow']
     irradiance_comp = ['direct']
 
-    def __init__(self, rho_front=0.01, rho_back=0.03):
+    def __init__(self, rho_front=0.01, rho_back=0.03, module_transparency=0.,
+                 module_spacing_ratio=0.):
         """Initialize irradiance model values that will be saved later on.
 
         Parameters
@@ -32,19 +34,31 @@ class IsotropicOrdered(BaseModel):
             Reflectivity of the front side of the PV rows (default = 0.01)
         rho_back : float, optional
             Reflectivity of the back side of the PV rows (default = 0.03)
+        module_transparency : float, optional
+            Module transparency (from 0 to 1), which will let some direct light
+            pass through the PV modules in the PV rows and reach the shaded
+            ground (Default = 0., fully opaque)
+        module_spacing_ratio : float, optional
+            Module spacing ratio (from 0 to 1), which is the ratio of the area
+            covered by the space between PV modules over the total area of the
+            PV rows, and which determines how much direct light will reach the
+            shaded ground through the PV rows
+            (Default = 0., no spacing at all)
         """
         self.direct = dict.fromkeys(self.cats)
         self.total_perez = dict.fromkeys(self.cats)
         self.isotropic_luminance = None
         self.rho_front = rho_front
         self.rho_back = rho_back
+        self.module_transparency = module_transparency
+        self.module_spacing_ratio = module_spacing_ratio
         self.albedo = None
         self.GHI = None
         self.DHI = None
 
     def fit(self, timestamps, DNI, DHI, solar_zenith, solar_azimuth,
             surface_tilt, surface_azimuth, albedo,
-            GHI=None):
+            ghi=None):
         """Use vectorization to calculate values used for the isotropic
         irradiance model.
 
@@ -66,7 +80,7 @@ class IsotropicOrdered(BaseModel):
             Surface azimuth angles [deg]
         albedo : array-like
             Albedo values (or ground reflectivity)
-        GHI : array-like, optional
+        ghi : array-like, optional
             Global horizontal irradiance [W/m2], if not provided, will be
             calculated from DNI and DHI (Default = None)
         """
@@ -79,27 +93,33 @@ class IsotropicOrdered(BaseModel):
             solar_azimuth = np.array([solar_azimuth])
             surface_tilt = np.array([surface_tilt])
             surface_azimuth = np.array([surface_azimuth])
-            GHI = None if GHI is None else np.array([GHI])
+            ghi = None if ghi is None else np.array([ghi])
         # Length of arrays
         n = len(DNI)
         # Make sure that albedo is a vector
         albedo = albedo * np.ones(n) if np.isscalar(albedo) else albedo
 
         # Save and calculate total POA values from Perez model
-        GHI = DNI * cosd(solar_zenith) + DHI if GHI is None else GHI
-        self.GHI = GHI
+        ghi = DNI * cosd(solar_zenith) + DHI if ghi is None else ghi
+        self.GHI = ghi
         self.DHI = DHI
         self.n_steps = n
         perez_front_pvrow = get_total_irradiance(
             surface_tilt, surface_azimuth, solar_zenith, solar_azimuth,
-            DNI, GHI, DHI, albedo=albedo)
+            DNI, ghi, DHI, albedo=albedo)
 
         # Save diffuse light
         self.isotropic_luminance = DHI
         self.albedo = albedo
 
         # DNI seen by ground illuminated surfaces
-        self.direct['ground'] = DNI * cosd(solar_zenith)
+        self.direct['ground_illum'] = DNI * cosd(solar_zenith)
+        self.direct['ground_shaded'] = (
+            # Direct light through PV modules spacing
+            self.direct['ground_illum'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['ground_illum'] * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
 
         # Calculate AOI on front pvrow using pvlib implementation
         aoi_front_pvrow = aoi_function(
@@ -108,11 +128,32 @@ class IsotropicOrdered(BaseModel):
 
         # DNI seen by pvrow illuminated surfaces
         front_is_illum = aoi_front_pvrow <= 90
-        self.direct['front_pvrow'] = np.where(
+        # direct
+        self.direct['front_illum_pvrow'] = np.where(
             front_is_illum, DNI * cosd(aoi_front_pvrow), 0.)
-        self.direct['back_pvrow'] = np.where(
+        self.direct['front_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.direct['front_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['front_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        self.direct['back_illum_pvrow'] = np.where(
             ~front_is_illum, DNI * cosd(aoi_back_pvrow), 0.)
-        self.total_perez['front_pvrow'] = perez_front_pvrow['poa_global']
+        self.direct['back_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.direct['back_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['back_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        # perez
+        self.total_perez['front_illum_pvrow'] = perez_front_pvrow['poa_global']
+        self.total_perez['front_shaded_pvrow'] = (
+            self.total_perez['front_illum_pvrow']
+            - self.direct['front_illum_pvrow'])
+        self.total_perez['ground_shaded'] = (self.DHI
+                                             + self.direct['ground_shaded'])
 
     def transform(self, pvarray):
         """Apply calculated irradiance values to PV array timeseries
@@ -133,12 +174,12 @@ class IsotropicOrdered(BaseModel):
 
         # Transform timeseries ground
         pvarray.ts_ground.illum_params.update(
-            {'direct': self.direct['ground'],
+            {'direct': self.direct['ground_illum'],
              'rho': self.albedo,
              'inv_rho': 1. / self.albedo,
              'total_perez': self.gnd_illum})
         pvarray.ts_ground.shaded_params.update(
-            {'direct': np.zeros(n_steps),
+            {'direct': self.direct['ground_shaded'],
              'rho': self.albedo,
              'inv_rho': 1. / self.albedo,
              'total_perez': self.gnd_shaded})
@@ -147,24 +188,24 @@ class IsotropicOrdered(BaseModel):
             # Front
             for ts_seg in ts_pvrow.front.list_segments:
                 ts_seg.illum.update_params(
-                    {'direct': self.direct['front_pvrow'],
+                    {'direct': self.direct['front_illum_pvrow'],
                      'rho': rho_front,
                      'inv_rho': inv_rho_front,
                      'total_perez': self.pvrow_illum})
                 ts_seg.shaded.update_params(
-                    {'direct': np.zeros(n_steps),
+                    {'direct': self.direct['front_shaded_pvrow'],
                      'rho': rho_front,
                      'inv_rho': inv_rho_front,
                      'total_perez': self.pvrow_shaded})
             # Back
             for ts_seg in ts_pvrow.back.list_segments:
                 ts_seg.illum.update_params(
-                    {'direct': self.direct['back_pvrow'],
+                    {'direct': self.direct['back_illum_pvrow'],
                      'rho': rho_back,
                      'inv_rho': inv_rho_back,
                      'total_perez': np.zeros(n_steps)})
                 ts_seg.shaded.update_params(
-                    {'direct': np.zeros(n_steps),
+                    {'direct': self.direct['back_shaded_pvrow'],
                      'rho': rho_back,
                      'inv_rho': inv_rho_back,
                      'total_perez': np.zeros(n_steps)})
@@ -209,7 +250,7 @@ class IsotropicOrdered(BaseModel):
     @property
     def gnd_shaded(self):
         """Total timeseries irradiance incident on ground shaded areas"""
-        return self.DHI
+        return self.total_perez['ground_shaded']
 
     @property
     def gnd_illum(self):
@@ -220,13 +261,13 @@ class IsotropicOrdered(BaseModel):
     def pvrow_shaded(self):
         """Total timeseries irradiance incident on PV row's front illuminated
         areas and calculated by Perez transposition"""
-        return self.pvrow_illum - self.direct['front_pvrow']
+        return self.total_perez['front_shaded_pvrow']
 
     @property
     def pvrow_illum(self):
         """Total timeseries irradiance incident on PV row's front shaded
         areas and calculated by Perez transposition"""
-        return self.total_perez['front_pvrow']
+        return self.total_perez['front_illum_pvrow']
 
     @property
     def sky_luminance(self):
@@ -244,13 +285,15 @@ class HybridPerezOrdered(BaseModel):
 
     params = ['rho', 'inv_rho', 'direct', 'isotropic', 'circumsolar',
               'horizon', 'reflection']
-    cats = ['ground', 'front_pvrow', 'back_pvrow']
+    cats = ['ground_illum', 'ground_shaded', 'front_illum_pvrow',
+            'back_illum_pvrow', 'front_shaded_pvrow', 'back_shaded_pvrow']
     irradiance_comp = ['direct', 'circumsolar', 'horizon']
 
     def __init__(self, horizon_band_angle=DEFAULT_HORIZON_BAND_ANGLE,
                  circumsolar_angle=DEFAULT_CIRCUMSOLAR_ANGLE,
                  circumsolar_model='uniform_disk', rho_front=0.01,
-                 rho_back=0.03):
+                 rho_back=0.03, module_transparency=0.,
+                 module_spacing_ratio=0.):
         """Initialize irradiance model values that will be saved later on.
 
         Parameters
@@ -267,6 +310,16 @@ class HybridPerezOrdered(BaseModel):
             Reflectivity of the front side of the PV rows (default = 0.01)
         rho_back : float, optional
             Reflectivity of the back side of the PV rows (default = 0.03)
+        module_transparency : float, optional
+            Module transparency (from 0 to 1), which will let some direct light
+            pass through the PV modules in the PV rows and reach the shaded
+            ground (Default = 0., fully opaque)
+        module_spacing_ratio : float, optional
+            Module spacing ratio (from 0 to 1), which is the ratio of the area
+            covered by the space between PV modules over the total area of the
+            PV rows, and which determines how much direct light will reach the
+            shaded ground through the PV rows
+            (Default = 0., no spacing at all)
         """
         self.direct = dict.fromkeys(self.cats)
         self.circumsolar = dict.fromkeys(self.cats)
@@ -278,6 +331,8 @@ class HybridPerezOrdered(BaseModel):
         self.circumsolar_model = circumsolar_model
         self.rho_front = rho_front
         self.rho_back = rho_back
+        self.module_transparency = module_transparency
+        self.module_spacing_ratio = module_spacing_ratio
         self.albedo = None
         self.GHI = None
         self.DNI = None
@@ -285,7 +340,7 @@ class HybridPerezOrdered(BaseModel):
 
     def fit(self, timestamps, DNI, DHI, solar_zenith, solar_azimuth,
             surface_tilt, surface_azimuth, albedo,
-            GHI=None):
+            ghi=None):
         """Use vectorization to calculate values used for the hybrid Perez
         irradiance model.
 
@@ -307,7 +362,7 @@ class HybridPerezOrdered(BaseModel):
             Surface azimuth angles [deg]
         albedo : array-like
             Albedo values (or ground reflectivity)
-        GHI : array-like, optional
+        ghi : array-like, optional
             Global horizontal irradiance [W/m2], if not provided, will be
             calculated from DNI and DHI (Default = None)
         """
@@ -320,7 +375,7 @@ class HybridPerezOrdered(BaseModel):
             solar_azimuth = np.array([solar_azimuth])
             surface_tilt = np.array([surface_tilt])
             surface_azimuth = np.array([surface_azimuth])
-            GHI = None if GHI is None else np.array([GHI])
+            ghi = None if ghi is None else np.array([ghi])
         # Length of arrays
         n = len(DNI)
         # Make sure that albedo is a vector
@@ -335,13 +390,13 @@ class HybridPerezOrdered(BaseModel):
                 surface_tilt, surface_azimuth)
 
         # Save and calculate total POA values from Perez model
-        GHI = DNI * cosd(solar_zenith) + DHI if GHI is None else GHI
-        self.GHI = GHI
+        ghi = DNI * cosd(solar_zenith) + DHI if ghi is None else ghi
+        self.GHI = ghi
         self.DHI = DHI
         self.n_steps = n
         perez_front_pvrow = get_total_irradiance(
             surface_tilt, surface_azimuth, solar_zenith, solar_azimuth,
-            DNI, GHI, DHI, albedo=albedo)
+            DNI, ghi, DHI, albedo=albedo)
         total_perez_front_pvrow = perez_front_pvrow['poa_global']
 
         # Save isotropic luminance
@@ -349,27 +404,80 @@ class HybridPerezOrdered(BaseModel):
         self.albedo = albedo
 
         # Ground surfaces
-        self.direct['ground'] = DNI * cosd(solar_zenith)
-        self.circumsolar['ground'] = luminance_circumsolar
+        self.direct['ground_illum'] = DNI * cosd(solar_zenith)
+        self.direct['ground_shaded'] = (
+            # Direct light through PV modules spacing
+            self.direct['ground_illum'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['ground_illum'] * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        self.circumsolar['ground_illum'] = luminance_circumsolar
+        self.circumsolar['ground_shaded'] = (
+            # Circumsolar light through PV modules spacing
+            self.circumsolar['ground_illum'] * self.module_spacing_ratio
+            # Circumsolar light through PV modules, by transparency
+            + self.circumsolar['ground_illum']
+            * (1. - self.module_spacing_ratio) * self.module_transparency)
         self.horizon['ground'] = np.zeros(n)
 
         # PV row surfaces
         front_is_illum = aoi_front_pvrow <= 90
-        self.direct['front_pvrow'] = np.where(
+        # direct
+        self.direct['front_illum_pvrow'] = np.where(
             front_is_illum, DNI * cosd(aoi_front_pvrow), 0.)
-        self.direct['back_pvrow'] = np.where(
+        self.direct['front_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.direct['front_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['front_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        self.direct['back_illum_pvrow'] = np.where(
             ~front_is_illum, DNI * cosd(aoi_back_pvrow), 0.)
-        self.circumsolar['front_pvrow'] = np.where(
+        self.direct['back_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.direct['back_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.direct['back_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        # circumsolar
+        self.circumsolar['front_illum_pvrow'] = np.where(
             front_is_illum, poa_circumsolar_front, 0.)
-        self.circumsolar['back_pvrow'] = np.where(
+        self.circumsolar['front_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.circumsolar['front_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.circumsolar['front_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        self.circumsolar['back_illum_pvrow'] = np.where(
             ~front_is_illum, poa_circumsolar_back, 0.)
+        self.circumsolar['back_shaded_pvrow'] = (
+            # Direct light through PV modules spacing
+            self.circumsolar['back_illum_pvrow'] * self.module_spacing_ratio
+            # Direct light through PV modules, by transparency
+            + self.circumsolar['back_illum_pvrow']
+            * (1. - self.module_spacing_ratio)
+            * self.module_transparency)
+        # horizon
         self.horizon['front_pvrow'] = poa_horizon
         self.horizon['back_pvrow'] = poa_horizon
+        # perez
         self.total_perez['front_illum_pvrow'] = total_perez_front_pvrow
         self.total_perez['front_shaded_pvrow'] = (
-            total_perez_front_pvrow - self.direct['front_pvrow'])
-        self.total_perez['ground_shaded'] = DHI
-        self.total_perez['ground_illum'] = GHI
+            total_perez_front_pvrow
+            - self.direct['front_illum_pvrow']
+            - self.circumsolar['front_illum_pvrow']
+            + self.direct['front_shaded_pvrow']
+            + self.circumsolar['front_shaded_pvrow']
+        )
+        self.total_perez['ground_shaded'] = (
+            DHI
+            - self.circumsolar['ground_illum']
+            + self.circumsolar['ground_shaded']
+            + self.direct['ground_shaded'])
+        self.total_perez['ground_illum'] = ghi
         self.total_perez['sky'] = luminance_isotropic
 
     def transform(self, pvarray):
@@ -393,15 +501,15 @@ class HybridPerezOrdered(BaseModel):
 
         # Transform timeseries ground
         pvarray.ts_ground.illum_params.update({
-            'direct': self.direct['ground'],
-            'circumsolar': self.circumsolar['ground'],
+            'direct': self.direct['ground_illum'],
+            'circumsolar': self.circumsolar['ground_illum'],
             'horizon': np.zeros(n_steps),
             'rho': self.albedo,
             'inv_rho': 1. / self.albedo,
             'total_perez': self.gnd_illum})
         pvarray.ts_ground.shaded_params.update({
-            'direct': np.zeros(n_steps),
-            'circumsolar': np.zeros(n_steps),
+            'direct': self.direct['ground_shaded'],
+            'circumsolar': self.circumsolar['ground_shaded'],
             'horizon': np.zeros(n_steps),
             'rho': self.albedo,
             'inv_rho': 1. / self.albedo,
@@ -412,15 +520,15 @@ class HybridPerezOrdered(BaseModel):
             # Front
             for ts_seg in ts_pvrow.front.list_segments:
                 ts_seg.illum.update_params({
-                    'direct': self.direct['front_pvrow'],
-                    'circumsolar': self.circumsolar['front_pvrow'],
+                    'direct': self.direct['front_illum_pvrow'],
+                    'circumsolar': self.circumsolar['front_illum_pvrow'],
                     'horizon': self.horizon['front_pvrow'],
                     'rho': rho_front,
                     'inv_rho': inv_rho_front,
                     'total_perez': self.pvrow_illum})
                 ts_seg.shaded.update_params({
-                    'direct': np.zeros(n_steps),
-                    'circumsolar': np.zeros(n_steps),
+                    'direct': self.direct['front_shaded_pvrow'],
+                    'circumsolar': self.circumsolar['front_shaded_pvrow'],
                     'horizon': self.horizon['front_pvrow'],
                     'rho': rho_front,
                     'inv_rho': inv_rho_front,
@@ -433,8 +541,8 @@ class HybridPerezOrdered(BaseModel):
                     ts_pvrows, centroid_illum, idx_pvrow, tilted_to_left,
                     is_back_side=True)
                 ts_seg.illum.update_params({
-                    'direct': self.direct['back_pvrow'],
-                    'circumsolar': self.circumsolar['back_pvrow'],
+                    'direct': self.direct['back_illum_pvrow'],
+                    'circumsolar': self.circumsolar['back_illum_pvrow'],
                     'horizon': self.horizon['back_pvrow'] *
                     (1. - hor_shd_pct_illum / 100.),
                     'horizon_unshaded': self.horizon['back_pvrow'],
@@ -448,8 +556,8 @@ class HybridPerezOrdered(BaseModel):
                     ts_pvrows, centroid_shaded, idx_pvrow, tilted_to_left,
                     is_back_side=True)
                 ts_seg.shaded.update_params({
-                    'direct': np.zeros(n_steps),
-                    'circumsolar': np.zeros(n_steps),
+                    'direct': self.direct['back_shaded_pvrow'],
+                    'circumsolar': self.circumsolar['back_shaded_pvrow'],
                     'horizon': self.horizon['back_pvrow'] *
                     (1. - hor_shd_pct_shaded / 100.),
                     'horizon_unshaded': self.horizon['back_pvrow'],
