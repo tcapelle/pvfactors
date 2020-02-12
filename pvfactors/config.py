@@ -16,6 +16,9 @@ DEFAULT_RHO_FRONT = 0.01
 DEFAULT_RHO_BACK = 0.03
 
 # Define colors used for plotting the 2D arrays
+
+
+
 COLOR_DIC = {
     'i': '#FFBB33',
     's': '#A7A49D',
